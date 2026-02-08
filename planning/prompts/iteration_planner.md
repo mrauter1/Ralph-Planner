@@ -47,10 +47,8 @@ You MUST read:
    - No implicit assumptions remain.
 6) Update synthesis.md:
    - Summarize key deltas since last iteration in <10 bullets.
-7) Update manifest.json:
-   - Include run_id, iteration, base_repo_sha, timestamps (if provided), and quick counts:
-     - blocking_questions_count
-     - files_changed_count
+7) Do NOT update manifest.json:
+   - The orchestrator owns manifest.json and will overwrite it.
 
 ## Planning-only safety rule
 If allow_code_changes is false:

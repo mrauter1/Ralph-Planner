@@ -16,6 +16,9 @@ from typing import Dict, List, Optional, Tuple
 
 REPO_DIGEST_JSON = "repo_digest.json"
 REPO_DIGEST_MD = "repo_digest.md"
+PLANNING_DIR = "planning"
+ARTIFACTS_SUBDIR = "planning/artifacts"
+STATE_FILE = "planning/state.json"
 
 ARTIFACT_FILES = [
     "impact.md",
@@ -224,7 +227,7 @@ def acquire_lock(repo_root: Path) -> Path:
     if lock_path.exists():
         contents = lock_path.read_text().strip()
         pid = int(contents.splitlines()[0]) if contents else None
-        if pid and Path(f"/proc/{pid}").exists():
+        if pid and pid_exists(pid):
             raise RuntimeError(f"Planning lock already held by PID {pid}")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path.write_text(f"{os.getpid()}\n")
@@ -234,6 +237,17 @@ def acquire_lock(repo_root: Path) -> Path:
 def release_lock(lock_path: Path) -> None:
     if lock_path.exists():
         lock_path.unlink()
+
+
+def pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    else:
+        return True
 
 
 def current_branch(repo_root: Path) -> str:
@@ -296,25 +310,25 @@ def enforce_clean_tree(repo_root: Path, allowed_prefixes: List[str]) -> None:
 
 
 def ensure_dirs(repo_root: Path) -> Path:
-    artifacts_dir = repo_root / "planning" / "artifacts"
+    artifacts_dir = repo_root / ARTIFACTS_SUBDIR
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    prompts_dir = repo_root / "planning" / "prompts"
+    prompts_dir = repo_root / PLANNING_DIR / "prompts"
     prompts_dir.mkdir(parents=True, exist_ok=True)
-    state_path = repo_root / "planning" / "state.json"
+    state_path = repo_root / STATE_FILE
     if not state_path.exists():
         state_path.write_text(json.dumps({"iteration": 0}, indent=2))
     return artifacts_dir
 
 
 def load_state(repo_root: Path) -> Dict[str, int]:
-    state_path = repo_root / "planning" / "state.json"
+    state_path = repo_root / STATE_FILE
     if not state_path.exists():
         return {"iteration": 0}
     return json.loads(state_path.read_text())
 
 
 def save_state(repo_root: Path, state: Dict[str, int]) -> None:
-    state_path = repo_root / "planning" / "state.json"
+    state_path = repo_root / STATE_FILE
     state_path.write_text(json.dumps(state, indent=2))
 
 
@@ -322,6 +336,8 @@ def limited_tree_summary(repo_root: Path, max_depth: int = 2, max_entries: int =
     entries: List[str] = []
     base_parts = len(repo_root.parts)
     for root, dirs, files in os.walk(repo_root):
+        if ".git" in dirs:
+            dirs.remove(".git")
         rel_parts = Path(root).parts[base_parts:]
         depth = len(rel_parts)
         if depth > max_depth:
@@ -407,7 +423,7 @@ def extract_tox_commands(path: Path) -> List[str]:
 def extract_makefile_targets(path: Path) -> List[str]:
     targets = []
     for line in path.read_text().splitlines():
-        if re.match(r"^[a-zA-Z0-9_-]+:\\s*$", line):
+        if re.match(r"^[a-zA-Z0-9_-]+:", line):
             target = line.split(":")[0]
             if target in {"test", "build", "lint"}:
                 targets.append(f"make {target}")
@@ -543,7 +559,7 @@ def acceptance_criteria_measurable(path: Path) -> bool:
     criteria_lines = [
         line for line in lines if line.startswith("-") or re.match(r"\d+\.", line)
     ]
-    if len(criteria_lines) < 2:
+    if not criteria_lines:
         return False
     for line in criteria_lines:
         if any(
@@ -623,21 +639,21 @@ def validate_artifacts(artifacts_dir: Path) -> Tuple[List[str], List[str]]:
     else:
         if not isinstance(open_questions.get("questions"), list):
             errors.append("open_questions.yaml 'questions' must be a list")
-            return errors, warnings
-        required_fields = {
-            "id",
-            "blocking",
-            "question",
-            "best_supposition",
-            "impact_if_wrong",
-        }
-        for item in open_questions.get("questions", []):
-            missing = required_fields - set(item.keys())
-            if missing:
-                errors.append(
-                    "open_questions.yaml question missing fields: "
-                    + ", ".join(sorted(missing))
-                )
+        else:
+            required_fields = {
+                "id",
+                "blocking",
+                "question",
+                "best_supposition",
+                "impact_if_wrong",
+            }
+            for item in open_questions.get("questions", []):
+                missing = required_fields - set(item.keys())
+                if missing:
+                    errors.append(
+                        "open_questions.yaml question missing fields: "
+                        + ", ".join(sorted(missing))
+                    )
 
     if not acceptance_criteria_measurable(artifacts_dir / "acceptance_criteria.md"):
         errors.append("acceptance_criteria.md lacks measurable criteria")
@@ -817,6 +833,8 @@ def update_manifest(
     run_id: str,
     backend: str,
     lock_path: Optional[Path],
+    planner_summary: Optional[Dict[str, object]],
+    reviewer_summary: Optional[Dict[str, object]],
 ) -> None:
     manifest = {
         "iteration": iteration,
@@ -830,13 +848,15 @@ def update_manifest(
         "backend": backend,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "lock_path": str(lock_path) if lock_path else None,
+        "planner_summary": planner_summary,
+        "reviewer_summary": reviewer_summary,
     }
     (artifacts_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 
 def stage_planning_files(repo_root: Path) -> None:
     subprocess.run(
-        ["git", "add", "planning/artifacts", "planning/state.json"],
+        ["git", "add", ARTIFACTS_SUBDIR, STATE_FILE],
         cwd=repo_root,
         check=True,
     )
@@ -886,6 +906,20 @@ def collect_diff_summary(repo_root: Path) -> str:
         check=True,
     )
     return result.stdout.strip()
+
+
+def parse_summary_block(stdout: str, tag: str) -> Tuple[Optional[Dict[str, object]], str]:
+    pattern = re.compile(
+        rf"<{tag}>(.*?)</{tag}>",
+        re.S,
+    )
+    match = pattern.search(stdout or "")
+    if not match:
+        return None, f"Missing <{tag}> block"
+    try:
+        return json.loads(match.group(1).strip()), ""
+    except json.JSONDecodeError as exc:
+        return None, f"Invalid JSON in <{tag}> block: {exc}"
 
 
 def changed_files(repo_root: Path) -> List[str]:
@@ -1069,12 +1103,22 @@ def main() -> int:
                 "ARTIFACTS_DIR": str(artifacts_dir),
             }
             validation_errors: List[str] = []
+            validation_warnings: List[str] = []
+            planner_summary: Optional[Dict[str, object]] = None
+            reviewer_summary: Optional[Dict[str, object]] = None
             try:
-                planner_code, _, planner_err = runner.run(
+                planner_code, planner_out, planner_err = runner.run(
                     role="planner", prompt=planner_prompt, repo_root=repo_root, env=env
                 )
                 if planner_code != 0:
                     validation_errors.append(f"Planner failed: {planner_err.strip()}")
+                parsed, error = parse_summary_block(
+                    planner_out, "planner_summary_json"
+                )
+                if error:
+                    validation_warnings.append(error)
+                else:
+                    planner_summary = parsed
             except RunnerError as exc:
                 validation_errors.append(str(exc))
             if not args.allow_code_changes:
@@ -1093,7 +1137,7 @@ def main() -> int:
                     prompt_values,
                 )
                 try:
-                    reviewer_code, _, reviewer_err = runner.run(
+                    reviewer_code, reviewer_out, reviewer_err = runner.run(
                         role="reviewer",
                         prompt=reviewer_prompt,
                         repo_root=repo_root,
@@ -1103,6 +1147,13 @@ def main() -> int:
                         validation_errors.append(
                             f"Reviewer failed: {reviewer_err.strip()}"
                         )
+                    parsed, error = parse_summary_block(
+                        reviewer_out, "reviewer_summary_json"
+                    )
+                    if error:
+                        validation_warnings.append(error)
+                    else:
+                        reviewer_summary = parsed
                 except RunnerError as exc:
                     validation_errors.append(str(exc))
                 after_reviewer = set(changed_files(repo_root))
@@ -1155,7 +1206,7 @@ def main() -> int:
             )
             if blocking_answered:
                 try:
-                    planner_code, _, planner_err = runner.run(
+                    planner_code, planner_out, planner_err = runner.run(
                         role="planner",
                         prompt=planner_prompt,
                         repo_root=repo_root,
@@ -1165,14 +1216,32 @@ def main() -> int:
                         validation_errors.append(
                             f"Planner failed after HITL: {planner_err.strip()}"
                         )
+                    parsed, error = parse_summary_block(
+                        planner_out, "planner_summary_json"
+                    )
+                    if error:
+                        validation_warnings.append(error)
+                    else:
+                        planner_summary = parsed
                 except RunnerError as exc:
                     validation_errors.append(str(exc))
 
-            artifact_errors, validation_warnings = validate_artifacts(artifacts_dir)
+            artifact_errors, artifact_warnings = validate_artifacts(artifacts_dir)
             validation_errors.extend(artifact_errors)
+            validation_warnings.extend(artifact_warnings)
             blocking_count = blocking_questions_count(
                 artifacts_dir / "open_questions.yaml"
             )
+
+            stage_planning_files(repo_root)
+            disallowed_staged = enforce_commit_scope(
+                repo_root, allowed_prefixes, args.allow_code_changes
+            )
+            if disallowed_staged:
+                validation_errors.append(
+                    "Disallowed files were staged and unstaged before commit: "
+                    + ", ".join(disallowed_staged)
+                )
 
             update_manifest(
                 artifacts_dir,
@@ -1185,30 +1254,10 @@ def main() -> int:
                 run_id=run_id,
                 backend=args.backend,
                 lock_path=lock_path,
+                planner_summary=planner_summary,
+                reviewer_summary=reviewer_summary,
             )
-
             stage_planning_files(repo_root)
-            disallowed_staged = enforce_commit_scope(
-                repo_root, allowed_prefixes, args.allow_code_changes
-            )
-            if disallowed_staged:
-                validation_errors.append(
-                    "Disallowed files were staged and unstaged before commit: "
-                    + ", ".join(disallowed_staged)
-                )
-                update_manifest(
-                    artifacts_dir,
-                    iteration=iteration,
-                    base_sha=base_sha,
-                    validation_errors=validation_errors,
-                    validation_warnings=validation_warnings,
-                    blocking_questions=blocking_count,
-                    must_fix_count=must_fix_count,
-                    run_id=run_id,
-                    backend=args.backend,
-                    lock_path=lock_path,
-                )
-                stage_planning_files(repo_root)
 
             status = (
                 "success" if not validation_errors and must_fix_count == 0 else "failure"
