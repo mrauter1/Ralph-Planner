@@ -30,7 +30,6 @@ You MUST maintain these files at the specified paths:
 - {ARTIFACTS_DIR}/repo_digest.md
 - {ARTIFACTS_DIR}/repo_digest.json
 - {ARTIFACTS_DIR}/synthesis.md
-- {ARTIFACTS_DIR}/manifest.json
 
 You MAY update planning/state.json if instructed by the orchestrator.
 

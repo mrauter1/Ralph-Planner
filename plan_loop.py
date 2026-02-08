@@ -265,6 +265,10 @@ def pid_matches(pid: int, start_time: Optional[float]) -> bool:
         return True
     psutil_module = load_psutil_module()
     if psutil_module is None:
+        sys.stderr.write(
+            "Warning: 'psutil' not found. Cannot reliably check for stale locks "
+            "against PID reuse. Install 'psutil' for robust lock validation.\n"
+        )
         return True
     try:
         proc = psutil_module.Process(pid)
@@ -1083,30 +1087,13 @@ def run_planning_iteration(
     runner: AgentRunner,
     lock_path: Path,
 ) -> Tuple[bool, List[str], List[str]]:
-    base_sha = git_head_sha(repo_root)
-    run_id = (
-        f"{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}-"
-        f"{random.randint(1000,9999)}"
+    base_sha, run_id, prompt_values = prepare_iteration_context(
+        args=args,
+        repo_root=repo_root,
+        artifacts_dir=artifacts_dir,
+        branch=branch,
+        iteration=iteration,
     )
-
-    write_repo_digest(repo_root, artifacts_dir)
-
-    prompt_values = {
-        "RUN_ID": run_id,
-        "ITERATION": str(iteration),
-        "REPO_ROOT": str(repo_root),
-        "CURRENT_BRANCH": branch,
-        "REPO_SHA": base_sha,
-        "TASK_TITLE": args.task_title,
-        "USER_GOAL_TEXT": args.user_goal_text,
-        "CONSTRAINTS_TEXT": args.constraints_text,
-        "ARTIFACTS_DIR": ARTIFACTS_SUBDIR,
-        "ALLOW_CODE_CHANGES": str(args.allow_code_changes).lower(),
-        "ALLOWED_PATH_PREFIXES_CSV": ",".join(DEFAULT_ALLOWED_PREFIXES),
-        "DISALLOWED_PATH_PREFIXES_CSV": ",".join(DEFAULT_DISALLOWED_PREFIXES),
-        "DIFF_SUMMARY_TEXT": collect_diff_summary(repo_root),
-    }
-
     planner_prompt = render_prompt(
         repo_root / PLANNING_DIR / "prompts" / "iteration_planner.md",
         prompt_values,
@@ -1193,6 +1180,73 @@ def run_planning_iteration(
             + ", ".join(disallowed_staged)
         )
 
+    status = finalize_iteration(
+        repo_root=repo_root,
+        artifacts_dir=artifacts_dir,
+        iteration=iteration,
+        base_sha=base_sha,
+        run_id=run_id,
+        must_fix_count=must_fix_count,
+        blocking_count=blocking_count,
+        validation_errors=validation_errors,
+        validation_warnings=validation_warnings,
+        backend=args.backend,
+        lock_path=lock_path,
+        planner_summary=planner_summary,
+        reviewer_summary=reviewer_summary,
+    )
+
+    return status == "success", validation_errors, validation_warnings
+
+
+def prepare_iteration_context(
+    *,
+    args: argparse.Namespace,
+    repo_root: Path,
+    artifacts_dir: Path,
+    branch: str,
+    iteration: int,
+) -> Tuple[str, str, Dict[str, str]]:
+    base_sha = git_head_sha(repo_root)
+    run_id = (
+        f"{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}-"
+        f"{random.randint(1000,9999)}"
+    )
+    write_repo_digest(repo_root, artifacts_dir)
+    prompt_values = {
+        "RUN_ID": run_id,
+        "ITERATION": str(iteration),
+        "REPO_ROOT": str(repo_root),
+        "CURRENT_BRANCH": branch,
+        "REPO_SHA": base_sha,
+        "TASK_TITLE": args.task_title,
+        "USER_GOAL_TEXT": args.user_goal_text,
+        "CONSTRAINTS_TEXT": args.constraints_text,
+        "ARTIFACTS_DIR": ARTIFACTS_SUBDIR,
+        "ALLOW_CODE_CHANGES": str(args.allow_code_changes).lower(),
+        "ALLOWED_PATH_PREFIXES_CSV": ",".join(DEFAULT_ALLOWED_PREFIXES),
+        "DISALLOWED_PATH_PREFIXES_CSV": ",".join(DEFAULT_DISALLOWED_PREFIXES),
+        "DIFF_SUMMARY_TEXT": collect_diff_summary(repo_root),
+    }
+    return base_sha, run_id, prompt_values
+
+
+def finalize_iteration(
+    *,
+    repo_root: Path,
+    artifacts_dir: Path,
+    iteration: int,
+    base_sha: str,
+    run_id: str,
+    must_fix_count: int,
+    blocking_count: int,
+    validation_errors: List[str],
+    validation_warnings: List[str],
+    backend: str,
+    lock_path: Path,
+    planner_summary: Optional[Dict[str, object]],
+    reviewer_summary: Optional[Dict[str, object]],
+) -> str:
     update_manifest(
         artifacts_dir,
         iteration=iteration,
@@ -1202,7 +1256,7 @@ def run_planning_iteration(
         blocking_questions=blocking_count,
         must_fix_count=must_fix_count,
         run_id=run_id,
-        backend=args.backend,
+        backend=backend,
         lock_path=lock_path,
         planner_summary=planner_summary,
         reviewer_summary=reviewer_summary,
@@ -1218,8 +1272,7 @@ def run_planning_iteration(
         base_sha=base_sha,
         summary=summary,
     )
-
-    return status == "success", validation_errors, validation_warnings
+    return status
 
 
 def changed_files(repo_root: Path) -> List[str]:
@@ -1371,7 +1424,7 @@ def main() -> int:
             state["iteration"] = iteration
             save_state(repo_root, state)
 
-            succeeded, _, _ = run_planning_iteration(
+            succeeded, validation_errors, validation_warnings = run_planning_iteration(
                 args=args,
                 repo_root=repo_root,
                 artifacts_dir=artifacts_dir,
@@ -1381,8 +1434,18 @@ def main() -> int:
                 runner=runner,
                 lock_path=lock_path,
             )
+            if validation_warnings:
+                print("--- Warnings ---", file=sys.stderr)
+                for warning in validation_warnings:
+                    print(f"- {warning}", file=sys.stderr)
             if succeeded:
+                print("Planning iteration succeeded.", file=sys.stderr)
                 return 0
+            if validation_errors:
+                print("--- Errors ---", file=sys.stderr)
+                for error in validation_errors:
+                    print(f"- {error}", file=sys.stderr)
+            print("Planning iteration failed.", file=sys.stderr)
 
         return 1
     finally:
