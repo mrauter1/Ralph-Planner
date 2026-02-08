@@ -75,6 +75,12 @@ def load_toml_module():
     return None
 
 
+def load_psutil_module():
+    if importlib.util.find_spec("psutil") is None:
+        return None
+    return importlib.import_module("psutil")
+
+
 @dataclass
 class RunResult:
     status: str
@@ -224,14 +230,23 @@ def ensure_git_repo(repo_root: Path) -> None:
 
 def acquire_lock(repo_root: Path) -> Path:
     lock_path = repo_root / LOCK_FILE
-    if lock_path.exists():
-        contents = lock_path.read_text().strip()
-        pid = int(contents.splitlines()[0]) if contents else None
-        if pid and pid_exists(pid):
-            raise RuntimeError(f"Planning lock already held by PID {pid}")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.write_text(f"{os.getpid()}\n")
-    return lock_path
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    for _ in range(2):
+        try:
+            fd = os.open(lock_path, flags)
+        except FileExistsError:
+            contents = lock_path.read_text().strip()
+            pid = int(contents.splitlines()[0]) if contents else None
+            if pid and pid_exists(pid):
+                raise RuntimeError(f"Planning lock already held by PID {pid}")
+            lock_path.unlink(missing_ok=True)
+            continue
+        else:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(f"{os.getpid()}\n")
+            return lock_path
+    raise RuntimeError("Unable to acquire planning lock")
 
 
 def release_lock(lock_path: Path) -> None:
@@ -242,6 +257,9 @@ def release_lock(lock_path: Path) -> None:
 def pid_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    psutil_module = load_psutil_module()
+    if psutil_module is not None:
+        return psutil_module.pid_exists(pid)
     try:
         os.kill(pid, 0)
     except OSError:
@@ -423,7 +441,7 @@ def extract_tox_commands(path: Path) -> List[str]:
 def extract_makefile_targets(path: Path) -> List[str]:
     targets = []
     for line in path.read_text().splitlines():
-        if re.match(r"^[a-zA-Z0-9_-]+:", line):
+        if re.match(r"^\s*[a-zA-Z0-9_-]+:", line):
             target = line.split(":")[0]
             if target in {"test", "build", "lint"}:
                 targets.append(f"make {target}")
@@ -512,9 +530,13 @@ def write_repo_digest(repo_root: Path, artifacts_dir: Path) -> Dict[str, object]
 
 def render_prompt(template_path: Path, values: Dict[str, str]) -> str:
     content = template_path.read_text()
-    for key, value in values.items():
-        content = content.replace("{" + key + "}", value)
-    return content
+    pattern = re.compile(r"\{([A-Z0-9_]+)\}")
+
+    def replace(match: re.Match) -> str:
+        key = match.group(1)
+        return values.get(key, match.group(0))
+
+    return pattern.sub(replace, content)
 
 
 def parse_open_questions(path: Path) -> Dict[str, object]:
@@ -893,7 +915,11 @@ def commit_iteration(
     summary: str,
 ) -> None:
     message = f"plan(iter {iteration:03d}): {status} | {summary} | base={base_sha}"
-    subprocess.run(["git", "commit", "-m", message], cwd=repo_root, check=True)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", message],
+        cwd=repo_root,
+        check=True,
+    )
 
 
 def collect_diff_summary(repo_root: Path) -> str:
@@ -920,6 +946,95 @@ def parse_summary_block(stdout: str, tag: str) -> Tuple[Optional[Dict[str, objec
         return json.loads(match.group(1).strip()), ""
     except json.JSONDecodeError as exc:
         return None, f"Invalid JSON in <{tag}> block: {exc}"
+
+
+def run_planner(
+    *,
+    runner: AgentRunner,
+    repo_root: Path,
+    prompt: str,
+    env: Dict[str, str],
+    validation_errors: List[str],
+    validation_warnings: List[str],
+) -> Optional[Dict[str, object]]:
+    try:
+        planner_code, planner_out, planner_err = runner.run(
+            role="planner", prompt=prompt, repo_root=repo_root, env=env
+        )
+        if planner_code != 0:
+            validation_errors.append(f"Planner failed: {planner_err.strip()}")
+        parsed, error = parse_summary_block(planner_out, "planner_summary_json")
+        if error:
+            validation_warnings.append(error)
+        else:
+            return parsed
+    except RunnerError as exc:
+        validation_errors.append(str(exc))
+    return None
+
+
+def run_reviewer_rounds(
+    *,
+    runner: AgentRunner,
+    repo_root: Path,
+    prompt: str,
+    env: Dict[str, str],
+    prompt_values: Dict[str, str],
+    max_rounds: int,
+    validation_errors: List[str],
+    validation_warnings: List[str],
+) -> Tuple[int, Optional[Dict[str, object]]]:
+    reviewer_summary: Optional[Dict[str, object]] = None
+    must_fix_count = 0
+    for round_index in range(max_rounds):
+        before_reviewer = set(changed_files(repo_root))
+        try:
+            reviewer_code, reviewer_out, reviewer_err = runner.run(
+                role="reviewer",
+                prompt=prompt,
+                repo_root=repo_root,
+                env=env,
+            )
+            if reviewer_code != 0:
+                validation_errors.append(f"Reviewer failed: {reviewer_err.strip()}")
+            parsed, error = parse_summary_block(reviewer_out, "reviewer_summary_json")
+            if error:
+                validation_warnings.append(error)
+            else:
+                reviewer_summary = parsed
+        except RunnerError as exc:
+            validation_errors.append(str(exc))
+        after_reviewer = set(changed_files(repo_root))
+        reviewer_changes = sorted(after_reviewer - before_reviewer)
+        allowed_reviewer_changes = {
+            "planning/artifacts/review.md",
+            "planning/artifacts/synthesis.md",
+        }
+        if reviewer_changes and not set(reviewer_changes).issubset(
+            allowed_reviewer_changes
+        ):
+            validation_errors.append(
+                "Reviewer modified disallowed files: " + ", ".join(reviewer_changes)
+            )
+        must_fix_count = detect_must_fix(Path(env["ARTIFACTS_DIR"]) / "review.md")
+        if must_fix_count == 0:
+            break
+        if round_index + 1 >= max_rounds:
+            break
+        reconcile_prompt = render_prompt(
+            repo_root / PLANNING_DIR / "prompts" / "reconcile_planner.md",
+            prompt_values,
+        )
+        try:
+            runner.run(
+                role="planner",
+                prompt=reconcile_prompt,
+                repo_root=repo_root,
+                env=env,
+            )
+        except RunnerError as exc:
+            validation_errors.append(str(exc))
+    return must_fix_count, reviewer_summary
 
 
 def changed_files(repo_root: Path) -> List[str]:
@@ -1106,21 +1221,14 @@ def main() -> int:
             validation_warnings: List[str] = []
             planner_summary: Optional[Dict[str, object]] = None
             reviewer_summary: Optional[Dict[str, object]] = None
-            try:
-                planner_code, planner_out, planner_err = runner.run(
-                    role="planner", prompt=planner_prompt, repo_root=repo_root, env=env
-                )
-                if planner_code != 0:
-                    validation_errors.append(f"Planner failed: {planner_err.strip()}")
-                parsed, error = parse_summary_block(
-                    planner_out, "planner_summary_json"
-                )
-                if error:
-                    validation_warnings.append(error)
-                else:
-                    planner_summary = parsed
-            except RunnerError as exc:
-                validation_errors.append(str(exc))
+            planner_summary = run_planner(
+                runner=runner,
+                repo_root=repo_root,
+                prompt=planner_prompt,
+                env=env,
+                validation_errors=validation_errors,
+                validation_warnings=validation_warnings,
+            )
             if not args.allow_code_changes:
                 disallowed_changes = find_disallowed_changes(repo_root, allowed_prefixes)
                 if disallowed_changes:
@@ -1129,64 +1237,20 @@ def main() -> int:
                         + ", ".join(disallowed_changes)
                     )
 
-            must_fix_count = 0
-            for round_index in range(args.max_review_rounds):
-                before_reviewer = set(changed_files(repo_root))
-                reviewer_prompt = render_prompt(
-                    repo_root / "planning" / "prompts" / "iteration_reviewer.md",
-                    prompt_values,
-                )
-                try:
-                    reviewer_code, reviewer_out, reviewer_err = runner.run(
-                        role="reviewer",
-                        prompt=reviewer_prompt,
-                        repo_root=repo_root,
-                        env=env,
-                    )
-                    if reviewer_code != 0:
-                        validation_errors.append(
-                            f"Reviewer failed: {reviewer_err.strip()}"
-                        )
-                    parsed, error = parse_summary_block(
-                        reviewer_out, "reviewer_summary_json"
-                    )
-                    if error:
-                        validation_warnings.append(error)
-                    else:
-                        reviewer_summary = parsed
-                except RunnerError as exc:
-                    validation_errors.append(str(exc))
-                after_reviewer = set(changed_files(repo_root))
-                reviewer_changes = sorted(after_reviewer - before_reviewer)
-                allowed_reviewer_changes = {
-                    "planning/artifacts/review.md",
-                    "planning/artifacts/synthesis.md",
-                }
-                if reviewer_changes and not set(reviewer_changes).issubset(
-                    allowed_reviewer_changes
-                ):
-                    validation_errors.append(
-                        "Reviewer modified disallowed files: "
-                        + ", ".join(reviewer_changes)
-                    )
-                must_fix_count = detect_must_fix(artifacts_dir / "review.md")
-                if must_fix_count == 0:
-                    break
-                if round_index + 1 >= args.max_review_rounds:
-                    break
-                reconcile_prompt = render_prompt(
-                    repo_root / "planning" / "prompts" / "reconcile_planner.md",
-                    prompt_values,
-                )
-                try:
-                    runner.run(
-                        role="planner",
-                        prompt=reconcile_prompt,
-                        repo_root=repo_root,
-                        env=env,
-                    )
-                except RunnerError as exc:
-                    validation_errors.append(str(exc))
+            reviewer_prompt = render_prompt(
+                repo_root / PLANNING_DIR / "prompts" / "iteration_reviewer.md",
+                prompt_values,
+            )
+            must_fix_count, reviewer_summary = run_reviewer_rounds(
+                runner=runner,
+                repo_root=repo_root,
+                prompt=reviewer_prompt,
+                env=env,
+                prompt_values=prompt_values,
+                max_rounds=args.max_review_rounds,
+                validation_errors=validation_errors,
+                validation_warnings=validation_warnings,
+            )
 
             if must_fix_count > 0:
                 try:
@@ -1195,7 +1259,7 @@ def main() -> int:
                         parse_must_fix_items(artifacts_dir / "review.md"),
                     )
                     if converted:
-                        validation_errors.append(
+                        validation_warnings.append(
                             "Reviewer must-fix converted to blocking questions"
                         )
                 except RuntimeError as exc:
@@ -1205,26 +1269,14 @@ def main() -> int:
                 artifacts_dir, noninteractive=args.noninteractive
             )
             if blocking_answered:
-                try:
-                    planner_code, planner_out, planner_err = runner.run(
-                        role="planner",
-                        prompt=planner_prompt,
-                        repo_root=repo_root,
-                        env=env,
-                    )
-                    if planner_code != 0:
-                        validation_errors.append(
-                            f"Planner failed after HITL: {planner_err.strip()}"
-                        )
-                    parsed, error = parse_summary_block(
-                        planner_out, "planner_summary_json"
-                    )
-                    if error:
-                        validation_warnings.append(error)
-                    else:
-                        planner_summary = parsed
-                except RunnerError as exc:
-                    validation_errors.append(str(exc))
+                planner_summary = run_planner(
+                    runner=runner,
+                    repo_root=repo_root,
+                    prompt=planner_prompt,
+                    env=env,
+                    validation_errors=validation_errors,
+                    validation_warnings=validation_warnings,
+                ) or planner_summary
 
             artifact_errors, artifact_warnings = validate_artifacts(artifacts_dir)
             validation_errors.extend(artifact_errors)
