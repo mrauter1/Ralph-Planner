@@ -222,6 +222,7 @@ def acquire_lock(repo_root: Path) -> Path:
     lock_path = repo_root / LOCK_FILE
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    # Retry once to handle a stale lock that was removed after PID validation.
     for _ in range(2):
         try:
             fd = os.open(lock_path, flags)
@@ -708,6 +709,11 @@ def validate_artifacts(artifacts_dir: Path) -> Tuple[List[str], List[str]]:
                 "impact_if_wrong",
             }
             for index, item in enumerate(open_questions.get("questions", [])):
+                if not isinstance(item, dict):
+                    errors.append(
+                        f"open_questions.yaml item at index {index} is not a dictionary"
+                    )
+                    continue
                 missing = required_fields - set(item.keys())
                 if missing:
                     question_id = item.get("id", "unknown")
@@ -1106,28 +1112,25 @@ def run_planning_iteration(
     planner_summary: Optional[Dict[str, object]] = None
     reviewer_summary: Optional[Dict[str, object]] = None
 
-    planner_summary = run_planner(
+    planner_summary = execute_planner_phase(
         runner=runner,
         repo_root=repo_root,
         prompt=planner_prompt,
         env=env,
+        allowed_prefixes=allowed_prefixes,
+        allow_code_changes=args.allow_code_changes,
         validation_errors=validation_errors,
         validation_warnings=validation_warnings,
     )
-    if not args.allow_code_changes:
-        disallowed_changes = find_disallowed_changes(repo_root, allowed_prefixes)
-        if disallowed_changes:
-            validation_errors.append(
-                "Planner modified disallowed files: " + ", ".join(disallowed_changes)
-            )
 
     reviewer_prompt = render_prompt(
         repo_root / PLANNING_DIR / "prompts" / "iteration_reviewer.md",
         prompt_values,
     )
-    must_fix_count, reviewer_summary = run_reviewer_rounds(
+    must_fix_count, reviewer_summary = execute_reviewer_phase(
         runner=runner,
         repo_root=repo_root,
+        artifacts_dir=artifacts_dir,
         prompt=reviewer_prompt,
         env=env,
         prompt_values=prompt_values,
@@ -1136,49 +1139,26 @@ def run_planning_iteration(
         validation_warnings=validation_warnings,
     )
 
-    if must_fix_count > 0:
-        try:
-            converted = add_blocking_questions_from_review(
-                artifacts_dir,
-                parse_must_fix_items(artifacts_dir / "review.md"),
-            )
-            if converted:
-                validation_warnings.append(
-                    "Reviewer must-fix converted to blocking questions"
-                )
-        except RuntimeError as exc:
-            validation_errors.append(str(exc))
-
-    blocking_answered = handle_blocking_questions(
-        artifacts_dir, noninteractive=args.noninteractive
+    planner_summary = handle_hitl_phase(
+        runner=runner,
+        repo_root=repo_root,
+        artifacts_dir=artifacts_dir,
+        prompt=planner_prompt,
+        env=env,
+        noninteractive=args.noninteractive,
+        validation_errors=validation_errors,
+        validation_warnings=validation_warnings,
+        planner_summary=planner_summary,
     )
-    if blocking_answered:
-        planner_summary = (
-            run_planner(
-                runner=runner,
-                repo_root=repo_root,
-                prompt=planner_prompt,
-                env=env,
-                validation_errors=validation_errors,
-                validation_warnings=validation_warnings,
-            )
-            or planner_summary
-        )
 
-    artifact_errors, artifact_warnings = validate_artifacts(artifacts_dir)
-    validation_errors.extend(artifact_errors)
-    validation_warnings.extend(artifact_warnings)
-    blocking_count = blocking_questions_count(artifacts_dir / "open_questions.yaml")
-
-    stage_planning_files(repo_root)
-    disallowed_staged = enforce_commit_scope(
-        repo_root, allowed_prefixes, args.allow_code_changes
+    blocking_count = finalize_validation(
+        repo_root=repo_root,
+        artifacts_dir=artifacts_dir,
+        allowed_prefixes=allowed_prefixes,
+        allow_code_changes=args.allow_code_changes,
+        validation_errors=validation_errors,
+        validation_warnings=validation_warnings,
     )
-    if disallowed_staged:
-        validation_errors.append(
-            "Disallowed files were staged and unstaged before commit: "
-            + ", ".join(disallowed_staged)
-        )
 
     status = finalize_iteration(
         repo_root=repo_root,
@@ -1197,6 +1177,127 @@ def run_planning_iteration(
     )
 
     return status == "success", validation_errors, validation_warnings
+
+
+def execute_planner_phase(
+    *,
+    runner: AgentRunner,
+    repo_root: Path,
+    prompt: str,
+    env: Dict[str, str],
+    allowed_prefixes: List[str],
+    allow_code_changes: bool,
+    validation_errors: List[str],
+    validation_warnings: List[str],
+) -> Optional[Dict[str, object]]:
+    planner_summary = run_planner(
+        runner=runner,
+        repo_root=repo_root,
+        prompt=prompt,
+        env=env,
+        validation_errors=validation_errors,
+        validation_warnings=validation_warnings,
+    )
+    if not allow_code_changes:
+        disallowed_changes = find_disallowed_changes(repo_root, allowed_prefixes)
+        if disallowed_changes:
+            validation_errors.append(
+                "Planner modified disallowed files: " + ", ".join(disallowed_changes)
+            )
+    return planner_summary
+
+
+def execute_reviewer_phase(
+    *,
+    runner: AgentRunner,
+    repo_root: Path,
+    artifacts_dir: Path,
+    prompt: str,
+    env: Dict[str, str],
+    prompt_values: Dict[str, str],
+    max_rounds: int,
+    validation_errors: List[str],
+    validation_warnings: List[str],
+) -> Tuple[int, Optional[Dict[str, object]]]:
+    must_fix_count, reviewer_summary = run_reviewer_rounds(
+        runner=runner,
+        repo_root=repo_root,
+        prompt=prompt,
+        env=env,
+        prompt_values=prompt_values,
+        max_rounds=max_rounds,
+        validation_errors=validation_errors,
+        validation_warnings=validation_warnings,
+    )
+    if must_fix_count > 0:
+        try:
+            converted = add_blocking_questions_from_review(
+                artifacts_dir,
+                parse_must_fix_items(artifacts_dir / "review.md"),
+            )
+            if converted:
+                validation_warnings.append(
+                    "Reviewer must-fix converted to blocking questions"
+                )
+        except RuntimeError as exc:
+            validation_errors.append(str(exc))
+    return must_fix_count, reviewer_summary
+
+
+def handle_hitl_phase(
+    *,
+    runner: AgentRunner,
+    repo_root: Path,
+    artifacts_dir: Path,
+    prompt: str,
+    env: Dict[str, str],
+    noninteractive: bool,
+    validation_errors: List[str],
+    validation_warnings: List[str],
+    planner_summary: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    blocking_answered = handle_blocking_questions(
+        artifacts_dir, noninteractive=noninteractive
+    )
+    if not blocking_answered:
+        return planner_summary
+    return (
+        run_planner(
+            runner=runner,
+            repo_root=repo_root,
+            prompt=prompt,
+            env=env,
+            validation_errors=validation_errors,
+            validation_warnings=validation_warnings,
+        )
+        or planner_summary
+    )
+
+
+def finalize_validation(
+    *,
+    repo_root: Path,
+    artifacts_dir: Path,
+    allowed_prefixes: List[str],
+    allow_code_changes: bool,
+    validation_errors: List[str],
+    validation_warnings: List[str],
+) -> int:
+    artifact_errors, artifact_warnings = validate_artifacts(artifacts_dir)
+    validation_errors.extend(artifact_errors)
+    validation_warnings.extend(artifact_warnings)
+    blocking_count = blocking_questions_count(artifacts_dir / "open_questions.yaml")
+
+    stage_planning_files(repo_root)
+    disallowed_staged = enforce_commit_scope(
+        repo_root, allowed_prefixes, allow_code_changes
+    )
+    if disallowed_staged:
+        validation_errors.append(
+            "Disallowed files were staged and unstaged before commit: "
+            + ", ".join(disallowed_staged)
+        )
+    return blocking_count
 
 
 def prepare_iteration_context(
@@ -1416,8 +1517,6 @@ def main() -> int:
 
     runner = build_runner(args.backend)
     lock_path = acquire_lock(repo_root)
-    atexit.register(release_lock, lock_path)
-
     try:
         for _ in range(args.max_iterations):
             iteration = state.get("iteration", 0) + 1
