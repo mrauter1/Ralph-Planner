@@ -633,10 +633,10 @@ def acceptance_criteria_measurable(path: Path) -> bool:
     return False
 
 
-def plan_references_impacts(path: Path) -> bool:
+def file_contains_impact_reference(path: Path) -> bool:
     if not path.exists():
         return False
-    return bool(re.search(r"Impact\s*:\s*\S+", path.read_text()))
+    return bool(re.search(r"Impact\s*:\s*\S.*", path.read_text()))
 
 
 def milestones_reference_impacts(path: Path) -> List[str]:
@@ -652,15 +652,9 @@ def milestones_reference_impacts(path: Path) -> List[str]:
         if not in_milestones:
             continue
         if line.strip().startswith("-"):
-            if not re.search(r"Impact\s*:\s*\S+", line):
+            if not re.search(r"Impact\s*:\s*\S.*", line):
                 missing.append(line.strip())
     return missing
-
-
-def impact_items_named(path: Path) -> bool:
-    if not path.exists():
-        return False
-    return bool(re.search(r"Impact\s*:\s*\S+", path.read_text()))
 
 
 def impact_has_headings(path: Path) -> List[str]:
@@ -687,7 +681,7 @@ def validate_artifacts(artifacts_dir: Path) -> Tuple[List[str], List[str]]:
             if heading not in (artifacts_dir / "plan.md").read_text():
                 errors.append(f"plan.md missing heading: {heading}")
 
-    if not plan_references_impacts(artifacts_dir / "plan.md"):
+    if not file_contains_impact_reference(artifacts_dir / "plan.md"):
         errors.append("plan.md missing Impact: <name> references")
     missing_milestones = milestones_reference_impacts(artifacts_dir / "plan.md")
     if missing_milestones:
@@ -695,7 +689,7 @@ def validate_artifacts(artifacts_dir: Path) -> Tuple[List[str], List[str]]:
             "plan.md milestones missing Impact: <name> references: "
             + "; ".join(missing_milestones)
         )
-    if not impact_items_named(artifacts_dir / "impact.md"):
+    if not file_contains_impact_reference(artifacts_dir / "impact.md"):
         errors.append("impact.md missing Impact: <name> items")
 
     open_questions = parse_open_questions(artifacts_dir / "open_questions.yaml")
