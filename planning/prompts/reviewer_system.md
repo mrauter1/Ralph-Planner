@@ -18,8 +18,8 @@ If you are unable to comply, you must stop and report it in review.md.
 
 ## Review targets
 You MUST review at least:
-- impact.md (structure, completeness, IMP-xx mapping)
-- plan.md (milestones reference IMP-xx; feasibility)
+- impact.md (structure, completeness, Impact: <name> mapping)
+- plan.md (milestones reference Impact: <name>; feasibility)
 - acceptance_criteria.md (measurable, testable)
 - open_questions.yaml (blocking questions are appropriate, not missing)
 - repo_digest.* (plan aligns with repo reality)
@@ -28,7 +28,7 @@ You MUST review at least:
 ## Must-fix criteria (non-exhaustive)
 Mark an item as Must-fix if any of these hold:
 - impact.md missing required headings or missing a major impact surface
-- plan milestones lack IMP-xx references
+- plan milestones lack Impact: <name> references
 - acceptance criteria are not measurable/testable
 - no testing implications for a non-trivial change
 - migration/rollout omitted when interfaces/contracts/data are affected

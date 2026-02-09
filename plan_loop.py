@@ -633,10 +633,10 @@ def acceptance_criteria_measurable(path: Path) -> bool:
     return False
 
 
-def plan_references_impacts(path: Path) -> bool:
+def file_contains_impact_reference(path: Path) -> bool:
     if not path.exists():
         return False
-    return bool(re.search(r"IMP-\d+", path.read_text()))
+    return bool(re.search(r"Impact\s*:\s*\S.*", path.read_text()))
 
 
 def milestones_reference_impacts(path: Path) -> List[str]:
@@ -652,7 +652,7 @@ def milestones_reference_impacts(path: Path) -> List[str]:
         if not in_milestones:
             continue
         if line.strip().startswith("-"):
-            if not re.search(r"IMP-\d+", line):
+            if not re.search(r"Impact\s*:\s*\S.*", line):
                 missing.append(line.strip())
     return missing
 
@@ -681,14 +681,16 @@ def validate_artifacts(artifacts_dir: Path) -> Tuple[List[str], List[str]]:
             if heading not in (artifacts_dir / "plan.md").read_text():
                 errors.append(f"plan.md missing heading: {heading}")
 
-    if not plan_references_impacts(artifacts_dir / "plan.md"):
-        errors.append("plan.md missing IMP-xx references")
+    if not file_contains_impact_reference(artifacts_dir / "plan.md"):
+        errors.append("plan.md missing Impact: <name> references")
     missing_milestones = milestones_reference_impacts(artifacts_dir / "plan.md")
     if missing_milestones:
         errors.append(
-            "plan.md milestones missing IMP-xx references: "
+            "plan.md milestones missing Impact: <name> references: "
             + "; ".join(missing_milestones)
         )
+    if not file_contains_impact_reference(artifacts_dir / "impact.md"):
+        errors.append("impact.md missing Impact: <name> items")
 
     open_questions = parse_open_questions(artifacts_dir / "open_questions.yaml")
     if "_parse_error" in open_questions:
@@ -746,23 +748,23 @@ def write_dry_planner_artifacts(artifacts_dir: Path, env: Dict[str, str]) -> Non
                 "# Impact Analysis",
                 "",
                 "## Likely Code/Module Touch Points",
-                "- IMP-01: planning/plan_loop.py (orchestrator logic; high confidence)",
-                "- IMP-02: planning/prompts/* (prompt templates; high confidence)",
+                "- Impact: Orchestrator logic in planning/plan_loop.py (high confidence)",
+                "- Impact: Prompt templates in planning/prompts/* (high confidence)",
                 "",
                 "## Interfaces and Contracts Affected",
-                "- IMP-03: CLI flags and artifact schemas (medium confidence)",
+                "- Impact: CLI flags and artifact schemas (medium confidence)",
                 "",
                 "## Dependency and Compatibility Consequences",
-                "- IMP-04: Requires git CLI availability (high confidence)",
+                "- Impact: Requires git CLI availability (high confidence)",
                 "",
                 "## Testing Implications",
-                "- IMP-05: Validate artifacts and ensure commit-only planning files",
+                "- Impact: Validate artifacts and ensure commit-only planning files",
                 "",
                 "## Rollout / Migration Plan",
-                "- IMP-06: Run on feature branch; no migrations expected",
+                "- Impact: Run on feature branch; no migrations expected",
                 "",
                 "## Operational Risks",
-                "- IMP-07: Runner command missing; handle with failure commit",
+                "- Impact: Runner command missing; handle with failure commit",
             ]
         )
     )
@@ -781,9 +783,9 @@ def write_dry_planner_artifacts(artifacts_dir: Path, env: Dict[str, str]) -> Non
                 "- Implement a Python orchestrator with pluggable runners; avoid SDK lock-in.",
                 "",
                 "## Milestones and Tasks",
-                "- M1 (IMP-01, IMP-03): Implement CLI, git preflight, and repo digest generation.",
-                "- M2 (IMP-02, IMP-05): Generate planner artifacts and run validation.",
-                "- M3 (IMP-07, IMP-04): Add reviewer run and failure-safe commits.",
+                "- M1 (Impact: Orchestrator logic in planning/plan_loop.py; Impact: CLI flags and artifact schemas): Implement CLI, git preflight, and repo digest generation.",
+                "- M2 (Impact: Prompt templates in planning/prompts/*; Impact: Validate artifacts and ensure commit-only planning files): Generate planner artifacts and run validation.",
+                "- M3 (Impact: Runner command missing; handle with failure commit; Impact: Requires git CLI availability): Add reviewer run and failure-safe commits.",
                 "",
                 "## Validation and Testing Plan",
                 "- Run script with --backend dry to verify artifacts and validation output.",
@@ -844,7 +846,7 @@ def write_dry_review(artifacts_dir: Path, env: Dict[str, str]) -> None:
                 "",
                 "## Checklist (pass/fail per check)",
                 "- [pass] impact.md has required headings",
-                "- [pass] plan milestones reference IMP-xx",
+                "- [pass] plan milestones reference Impact: <name>",
                 "- [pass] acceptance criteria measurable",
                 "- [pass] testing implications included",
                 "- [pass] open questions captured",

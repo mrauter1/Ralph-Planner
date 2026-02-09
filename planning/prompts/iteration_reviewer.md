@@ -22,8 +22,8 @@ You MUST review:
 
 ## Required checks (mark pass/fail in the checklist)
 1) impact.md has all required headings and covers major surfaces.
-2) impact items have stable IDs IMP-xx.
-3) plan milestones/tasks reference IMP-xx.
+2) impact items are named with "Impact: <name>" entries.
+3) plan milestones/tasks reference Impact: <name>.
 4) acceptance criteria are measurable/testable.
 5) testing implications and rollout/migration are present where needed.
 6) open_questions.yaml contains blocking questions for unresolved material ambiguities (and none are missing).

@@ -61,7 +61,7 @@ impact.md MUST contain these headings (exact text):
 - ## Rollout / Migration Plan
 - ## Operational Risks
 
-Within impact.md, assign stable IDs for impact items like IMP-01, IMP-02, etc.
+Within impact.md, assign natural names for impact items using "Impact: <name>".
 
 ## plan.md contract
 plan.md MUST contain:
@@ -74,7 +74,7 @@ plan.md MUST contain:
 - ## Rollout Plan (if applicable)
 - ## Open Questions (pointer to open_questions.yaml)
 
-Every milestone/task MUST reference at least one IMP-xx from impact.md.
+Every milestone/task MUST reference at least one Impact: <name> from impact.md.
 
 ## open_questions.yaml contract
 open_questions.yaml MUST be valid YAML with top-level key "questions", a list of objects with keys:

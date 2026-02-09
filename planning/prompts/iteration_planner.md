@@ -33,9 +33,9 @@ You MUST read:
 ## Required actions (in order)
 1) Update impact.md first:
    - Ensure all required headings exist.
-   - Ensure IMP-xx items are present for all major impact surfaces.
+   - Ensure Impact: <name> items are present for all major impact surfaces.
 2) Update plan.md:
-   - Every milestone/task references IMP-xx.
+   - Every milestone/task references Impact: <name>.
    - Include alternatives considered and why chosen approach fits THIS repo.
 3) Update acceptance_criteria.md:
    - Make criteria measurable and testable.
